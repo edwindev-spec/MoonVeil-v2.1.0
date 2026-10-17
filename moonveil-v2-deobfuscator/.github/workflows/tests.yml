@@ -1,0 +1,41 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install ruff
+      - run: ruff check --target-version py39 --select F,E9,B moonveil tools tests
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python tools/install_luau.py
+      - run: python -B -m unittest discover -s tests -v
+        env:
+          MOONVEIL_REQUIRE_LUAU: '1'
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tools/install_luau.py
+      - run: python -B -m unittest discover -s tests -p test_fuzz.py -v
+        env:
+          MOONVEIL_REQUIRE_LUAU: '1'
+          MOONVEIL_FUZZ_CASES: '1000'
+          MOONVEIL_FUZZ_SEED: ${{ github.run_number }}

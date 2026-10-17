@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moonveil-v2-deobfuscator"
+dynamic = ["version"]
+description = "Recover Luau from the supported MoonVeil 2.1.0 table-dispatch profile"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+readme = "README.md"
+keywords = ["luau", "roblox", "deobfuscation", "moonveil", "malware-analysis"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Security",
+    "Topic :: Software Development :: Disassemblers",
+]
+
+[project.scripts]
+moonveil = "moonveil.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "moonveil.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["moonveil*"]
