@@ -77,3 +77,23 @@ Un ejecutor simbólico recorre las instrucciones sin ejecutarlas. Cada lectura d
 Los globales con nombre válido se emiten sin más (`loadstring`); el resto usa `environment[...]` con `local environment = getfenv()`. Los parámetros no usados no se declaran.
 
 `--style auto` usa `structured` y recurre a `registers` si el estilo estructurado se rechaza o si `luau-compile` no acepta su resultado.
+
+## Modo `trace`
+
+`moonveil/trace.py` genera un script de Luau que:
+
+1. Compila el programa con `loadstring` a partir de un literal con **todos los bytes escapados** (`\xNN`), de modo que el texto de la entrada nunca puede salirse de su cadena ni ejecutarse en el entorno real del script.
+2. Le asigna con `setfenv` un entorno cuyo `__index` devuelve únicamente librerías puras (`string`, `table`, `bit32`, `math`, `utf8`, `buffer`, funciones básicas y un subconjunto de `os` con `clock/time/date/difftime`) y, para cualquier otro nombre, un *marcador*. `getfenv` devuelve siempre ese entorno y `setfenv` es inerte.
+3. Cada marcador tiene una metatabla bloqueada: `__index` y `__call` anotan un evento y devuelven otro marcador; cualquier cálculo o asignación detiene el trazado con un motivo.
+
+Registro (líneas separadas por tabuladores, entre `MOONVEIL_TRACE_BEGIN` y `MOONVEIL_TRACE_END`):
+
+| Registro | Significado |
+| --- | --- |
+| `G id nombre` | Lectura de un global (nombre en hexadecimal) |
+| `I id base clave` | Indexación de un marcador |
+| `C id función n arg...` | Llamada con `n` argumentos |
+| `T id` / `E id clave valor` | Tabla constante pasada como argumento y sus entradas |
+| `S`, `F`, `X` | Estado final, motivo de parada y error del programa |
+
+Los átomos son `Z` (nil), `B0/B1`, `N<número>`, `S<hex>`, `P<id>` (marcador) y `T<id>` (tabla). `emit.emit_trace` convierte el registro en los mismos nodos que usa el emisor estructurado (con un tipo `index` y llamadas «naturales»), funde `obj.nombre(obj, ...)` en `obj:nombre(...)` cuando es seguro y aplica las mismas reglas de orden de efectos.

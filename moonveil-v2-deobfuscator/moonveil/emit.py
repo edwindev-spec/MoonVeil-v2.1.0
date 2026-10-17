@@ -42,7 +42,31 @@ _RESERVED = frozenset(
 # --------------------------------------------------------------------------- literals
 
 
+class LuaTable:
+    """A constant table recorded by a trace: ordered ``(key, value)`` pairs of constants."""
+
+    def __init__(self, items):
+        self.items = list(items)
+
+
+def _table_literal(table: LuaTable) -> str:
+    items = table.items
+    array = sorted(((k, v) for k, v in items if type(k) is int and k >= 1), key=lambda kv: kv[0])
+    length = 0
+    while length < len(array) and array[length][0] == length + 1:
+        length += 1
+    parts = [lua_literal(v) for _, v in array[:length]]
+    rest = array[length:] + [(k, v) for k, v in items if not (type(k) is int and k >= 1)]
+    rest.sort(key=lambda kv: (type(kv[0]).__name__, repr(kv[0])))
+    for key, value in rest:
+        name = identifier(key)
+        parts.append(f"{name} = {lua_literal(value)}" if name else f"[{lua_literal(key)}] = {lua_literal(value)}")
+    return "{" + ", ".join(parts) + "}"
+
+
 def lua_literal(value):
+    if isinstance(value, LuaTable):
+        return _table_literal(value)
     if isinstance(value, bytes):
         parts = []
         for byte in value:
@@ -102,7 +126,7 @@ class _Param:
 class _Node:
     """One effectful instruction: a global read, a method lookup or a call."""
 
-    kind: str  # "global" | "self" | "call"
+    kind: str  # "global" | "index" | "self" | "call"
     pc: int
     key: Optional[bytes] = None
     recv: object = None
@@ -111,6 +135,7 @@ class _Node:
     tail: Optional[_Node] = None  # open call spliced as the final argument
     results: int = 0  # calls: fixed result count; -1 means open (C = 0)
     base: int = 0
+    natural: bool = False  # traced call: its result count is unobservable, never wrap in parentheses
     # Filled by the use analysis.
     uses: List[int] = field(default_factory=list)
     consumers: List[list] = field(default_factory=list)
@@ -233,7 +258,7 @@ def _analyze_uses(program: _Program) -> None:
             operand.node.consumers[operand.index].append((consumer, slot))
 
     for node in program.nodes:
-        if node.kind == "self":
+        if node.kind in ("self", "index"):
             use(node.recv, node, "recv")
         elif node.kind == "call":
             use(node.fn, node, "fn")
@@ -259,8 +284,12 @@ def _analyze_uses(program: _Program) -> None:
 
 
 class _Emitter:
-    def __init__(self, program: _Program):
+    banner = "-- Recovered from MoonVeil 2.1.0; original names and comments are unavailable."
+
+    def __init__(self, program: _Program, banner: Optional[str] = None):
         self.program = program
+        if banner:
+            self.banner = banner
         self.lines: List[str] = []
         self.pending: List[_Node] = []
         self.locals = 0
@@ -307,7 +336,7 @@ class _Emitter:
             return node.names[operand.index]
         # Inline expression. A call keeps only its first value unless it is the
         # last element of a list, where Luau would expand every result.
-        if last and node.kind == "call":
+        if last and node.kind == "call" and not node.natural:
             return f"({node.text})"
         return node.text
 
@@ -339,7 +368,7 @@ class _Emitter:
             if isinstance(operand, _Ref) and operand.node.pending:
                 found.append(operand.node)
 
-        if node.kind == "self":
+        if node.kind in ("self", "index"):
             look(node.recv)
         elif node.kind == "call":
             if self.is_fused(node):
@@ -372,6 +401,11 @@ class _Emitter:
         node.pending = False
         if node.kind == "global":
             name = self.fresh("g_" + (identifier(node.key) or "global")) if node.uses[0] else "_"
+            self.declare()
+            self.lines.append(f"local {name} = {node.text}")
+            node.names = [name]
+        elif node.kind == "index":
+            name = self.fresh("i_" + (identifier(node.key) or "index")) if node.uses[0] else "_"
             self.declare()
             self.lines.append(f"local {name} = {node.text}")
             node.names = [name]
@@ -428,6 +462,9 @@ class _Emitter:
         elif node.kind == "self":
             node.recv_text = self.operand(node.recv, prefix=True)
             node.text = node.recv_text
+        elif node.kind == "index":
+            base = self.operand(node.recv, prefix=True)
+            node.text = _index(base, node.key) if isinstance(node.key, bytes) else f"{base}[{lua_literal(node.key)}]"
         else:
             node.text = self.call_text(node)
         node.depth = 1 + max([n.depth for n in operands], default=0)
@@ -447,7 +484,7 @@ class _Emitter:
             node.pending = False
 
     def inlinable(self, node: _Node) -> bool:
-        if node.kind == "global":
+        if node.kind in ("global", "index"):
             return node.uses[0] == 1
         if node.kind == "self":
             return node.fuse_with is not None
@@ -494,13 +531,81 @@ class _Emitter:
         body = header + self.lines
         if self.needs_environment:
             body.insert(0, f"local {self.environment} = getfenv()")
-        return "\n".join(["-- Recovered from MoonVeil 2.1.0; original names and comments are unavailable.", *body]) + "\n"
+        return "\n".join([self.banner, *body]) + "\n"
 
 
 def emit_structured(ir) -> str:
     program = _lift(ir)
     _analyze_uses(program)
     return _Emitter(program).run()
+
+
+# --------------------------------------------------------------------------- traces
+
+_TRACE_BANNER = ("-- Recovered by running the program against a symbolic environment: only operations on\n"
+                 "-- the environment appear, in the order they happened, and only the executed path is shown.")
+
+
+def emit_trace(trace) -> str:
+    """Render the environment operations recorded by :mod:`moonveil.trace` as Luau."""
+    nodes: List[_Node] = []
+    by_id: Dict[int, _Node] = {}
+    tables = trace["tables"]
+
+    def constant(atom, depth=0):
+        kind = atom["type"]
+        if kind == "nil":
+            return None
+        if kind in ("boolean", "number"):
+            return atom["value"]
+        if kind == "bytes":
+            return bytes.fromhex(atom["hex"])
+        if kind == "table" and depth < 8 and atom["id"] in tables:
+            return LuaTable((constant(k, depth + 1), constant(v, depth + 1)) for k, v in tables[atom["id"]])
+        raise MoonVeilError("a table passed to the environment holds symbolic values or is nested too deeply")
+
+    def operand(atom):
+        if atom["type"] == "proxy":
+            node = by_id.get(atom["id"])
+            if node is None:
+                raise MoonVeilError("trace refers to a value before it was created")
+            return _Ref(node, 0)
+        return _Const(constant(atom))
+
+    for number, event in enumerate(trace["events"], 1):
+        if event["op"] == "G":
+            node = _Node("global", number, key=event["name"])
+        elif event["op"] == "I":
+            key = event["key"]
+            if key["type"] == "proxy":
+                raise MoonVeilError("indexing with a symbolic key is not supported")
+            node = _Node("index", number, key=constant(key), recv=operand(event["base"]))
+        else:
+            args = [operand(a) for a in event["args"]]
+            node = _Node("call", number, fn=operand(event["fn"]), args=args, results=1, natural=True)
+        nodes.append(node)
+        by_id[event["id"]] = node
+
+    references: Dict[int, int] = {}
+    for node in nodes:
+        for operand_ in [node.recv, node.fn, *node.args]:
+            if isinstance(operand_, _Ref):
+                references[id(operand_.node)] = references.get(id(operand_.node), 0) + 1
+    # ``obj.name(obj, ...)`` is the shape of a method call: fuse it so ``obj:name(...)`` comes out.
+    for node in nodes:
+        fn = node.fn
+        if node.kind == "call" and isinstance(fn, _Ref) and fn.node.kind == "index" and node.args \
+                and references.get(id(fn.node)) == 1 and node.args[0] == fn.node.recv:
+            lookup = fn.node
+            lookup.kind = "self"
+            node.fn, node.args[0] = _Ref(lookup, 0), _Ref(lookup, 1)
+
+    program = _Program(nodes, [], None, 0, set())
+    _analyze_uses(program)
+    try:
+        return _Emitter(program, _TRACE_BANNER).run()
+    except _Unsupported as exc:
+        raise MoonVeilError(f"the trace is too large to express as one Luau chunk ({exc})") from exc
 
 
 # --------------------------------------------------------------------------- registers

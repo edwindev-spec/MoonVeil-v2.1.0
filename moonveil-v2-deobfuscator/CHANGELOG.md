@@ -1,5 +1,12 @@
 # Cambios
 
+## 0.3.0
+
+- **Modo `trace`** (`--mode trace|auto`): para layouts que el perfil estático no conoce, ejecuta el programa en un entorno simbólico (sin APIs reales) y reescribe sus operaciones como Luau. Recupera el segundo sample (flujo aplanado) como `loadstring(game:HttpGet("..."))()`. Es opcional y el manifiesto marca `protected_program_executed: true`.
+- **Diagnóstico de layout**: `analyze` y `decompile` explican en qué se diferencia un archivo (campos, nombres de método, huellas coincidentes) en lugar de solo «expected 35 unique names».
+- El emisor admite nodos de indexación y tablas constantes; nuevas pruebas de punto fijo (traza → Luau → traza) con programas escritos a mano y aleatorios.
+- Fixture adicional `tests/fixtures/moonveil-2.1.0-flattened.lua` (sample suministrado por el usuario).
+
 ## 0.2.0
 
 ### Recuperación

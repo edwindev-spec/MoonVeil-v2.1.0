@@ -68,6 +68,7 @@ Recovered 11 instructions: recuperado.luau (structured, compiled with official L
 | `--style auto\|structured\|registers` | `auto` (por defecto) emite Luau idiomático cuando puede demostrarse y, si no, el modelo de registros. Si `luau-compile` rechaza la versión estructurada, `auto` vuelve a registros y lo anota en el manifiesto. |
 | `--timeout 30` | Límite **por subproceso**; exige un número positivo y finito. |
 | `--memory-limit 1024` | Límite de espacio de direcciones por subproceso, en MiB (solo POSIX); `0` lo desactiva. |
+| `--mode vm\|auto\|trace` | `vm` (por defecto) usa solo el perfil estático y **nunca ejecuta el programa protegido**. `trace` lo ejecuta en un entorno simbólico (ver abajo). `auto` usa `vm` y pasa a `trace` solo si el layout no está soportado. |
 | `--json` | Imprime el manifiesto en JSON en lugar del resumen de texto. |
 | `-q, --quiet` | Solo errores. |
 
@@ -85,6 +86,35 @@ La herramienta protege la entrada frente a alias y enlaces duros. Cada archivo s
 
 Detalles del formato y sus offsets en [docs/FORMAT.md](docs/FORMAT.md).
 
+## Otros layouts: modo `trace`
+
+Algunos archivos MoonVeil 2.1.0 no tienen la VM por tabla del perfil calibrado (por ejemplo, flujo de control aplanado con las cadenas cifradas dentro de las funciones). `analyze` y `decompile` lo explican y dicen en qué se diferencian:
+
+```text
+$ python -m moonveil analyze otro.lua
+unsupported wrapper permutation (expected 35 unique names)
+  MoonVeil 2.1.0 banner, but a different layout: 19 wrapper fields and 16 method names (the supported profile has 35); 6 of 25 handler fingerprints match. The static VM profile cannot read it; --mode trace runs it in a symbolic sandbox instead
+```
+
+Con `--mode trace` el programa se ejecuta en Luau oficial contra un **entorno simbólico**: cada global que no sea una librería estándar pura (`string`, `table`, `bit32`, `math`, ...) es un marcador que solo anota la operación y devuelve otro marcador. Nada llega a una API, archivo ni red reales; `loadstring`, `game`, `require`, `io`, etc. son marcadores. El registro de operaciones se vuelve a escribir como Luau:
+
+```sh
+python -m moonveil decompile tests/fixtures/moonveil-2.1.0-flattened.lua --mode trace -o recuperado.luau --require-compile
+```
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/edwin3166/Test/refs/heads/main/Server.lua"))()
+```
+
+Cosas que debes saber:
+
+- **Ejecuta el programa protegido** (por eso es opcional y el manifiesto lo marca con `"protected_program_executed": true`). Con los límites de recursos descritos abajo, pero sin aislamiento del sistema operativo: usa un entorno desechable para entradas hostiles.
+- Recupera **lo que el programa hace con su entorno**, en el orden en que ocurre y por el camino que toma. No recupera el flujo de control original, los nombres ni el cálculo que no toque el entorno.
+- Se rechaza con una explicación, en lugar de adivinar, todo programa que calcule con valores del entorno (aritmética, concatenación, comparaciones), les asigne campos, pase funciones como argumentos (callbacks) o no llegue a terminar (límite de tiempo y de 20.000 operaciones).
+- Las llamadas se escriben con su resultado «natural» (`f(g())`): el número de resultados no es observable en una traza.
+- Las pruebas verifican que el Luau recuperado repite **exactamente la misma secuencia de operaciones** que el original (15 programas escritos a mano y un fuzzer de programas aleatorios), y que sobre el sample original coincide con el perfil estático.
+- `dump` y los artefactos `decoded.json`/`normalized.json` no existen en este modo; `--artifacts` escribe `trace.json` y `manifest.json`.
+
 ## Artefactos y límites
 
 Con `--artifacts` se generan:
@@ -96,7 +126,7 @@ Con `--artifacts` se generan:
 | `instructions.txt` | Desensamblado con PC desde 1 y operaciones identificadas |
 | `manifest.json` | Hashes de entrada/salida, perfil, estilo de emisión, recuentos, estado de compilación e indicadores |
 
-El soporte está calibrado para el layout y los handlers del sample. **No se garantiza cualquier archivo marcado 2.1.0**: layouts, offsets o handlers diferentes se rechazan con un error. El perfil actual no tiene handlers de cierres, upvalues, saltos o bucles del programa protegido; los prototipos anidados se rechazan. Tampoco admite 1.4.5.
+El perfil estático está calibrado para el layout y los handlers del sample. **No se garantiza cualquier archivo marcado 2.1.0**: layouts, offsets o handlers diferentes se rechazan con un error que describe la diferencia (para ellos existe el modo `trace`). El perfil actual no tiene handlers de cierres, upvalues, saltos o bucles del programa protegido; los prototipos anidados se rechazan. Tampoco admite 1.4.5.
 
 No se recuperan comentarios ni nombres originales. `compiled: true` significa que el compilador aceptó la salida; `compiled: null` indica que no estaba disponible. Usa `--require-compile` para exigirlo. El manifiesto deja `equivalent: null`: la CLI no ejecuta el programa recuperado para comparar su comportamiento.
 

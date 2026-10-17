@@ -202,3 +202,41 @@ def parse_wrapper(source: str) -> Wrapper:
     if roles["remapper"] != remapper or roles["bootstrap"] != entry:
         raise MoonVeilError("wrapper entry does not match the supported profile")
     return Wrapper(source, source[tokens[2].start:tokens[end].end], source[tail[4].start:tail[cursor].end], remapper, entry, methods, roles)
+
+
+def diagnose(source: str) -> dict:
+    """Describe how a MoonVeil-looking file differs from the supported layout. Never raises."""
+    banner = re.search(r"^\s*-- This script was generated using MoonVeil ([\d.]+)", source)
+    report = {"banner_version": banner[1] if banner else None, "wrapper_fields": None, "method_names": None,
+              "expected_method_names": 35, "matched_handlers": [], "profile_handlers": len(PROFILE)}
+    try:
+        tokens = tokenize(source)
+        if [t.text for t in tokens[:3]] != ["return", "(", "{"]:
+            return report
+        fields, end = _fields(tokens, 2)
+        report["wrapper_fields"] = len(fields)
+        report["method_names"] = sum(1 for t in tokens[end + 1:] if t.kind == "string") - 1
+        known = {fingerprint: role for role, fingerprint in PROFILE.items()}
+        matched = []
+        for field in fields:
+            body = field[2:] if len(field) >= 3 and field[0].kind == "name" and field[1].text == "=" else field
+            if body:
+                role = known.get(canonical(source[body[0].start:body[-1].end]))
+                if role:
+                    matched.append(role)
+        report["matched_handlers"] = sorted(set(matched))
+    except MoonVeilError:
+        pass
+    return report
+
+
+def explain_layout(report: dict) -> str:
+    """One-sentence human summary of :func:`diagnose`, with the way forward."""
+    if report["banner_version"] is None:
+        return "no MoonVeil banner was found"
+    if report["wrapper_fields"] is None:
+        return f"MoonVeil {report['banner_version']} banner, but the file does not have the supported wrapper shape"
+    return (f"MoonVeil {report['banner_version']} banner, but a different layout: {report['wrapper_fields']} wrapper fields and "
+            f"{report['method_names']} method names (the supported profile has {report['expected_method_names']}); "
+            f"{len(report['matched_handlers'])} of {report['profile_handlers']} handler fingerprints match. "
+            "The static VM profile cannot read it; --mode trace runs it in a symbolic sandbox instead")

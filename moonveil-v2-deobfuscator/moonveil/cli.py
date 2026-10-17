@@ -12,15 +12,18 @@ from pathlib import Path
 from . import __version__
 from .analysis import indicators
 from .decoder import decode
-from .emit import STYLES, emit
+from .emit import STYLES, emit, emit_trace
 from .errors import MoonVeilError
 from .runtime import DEFAULT_MEMORY_MB, compile_source, find_luau, positive_memory, positive_timeout
-from .source import parse_wrapper
+from .source import diagnose, explain_layout, parse_wrapper
 from .storage import check_destinations, read_source, write_json, write_text
+from .trace import log_json, trace, trace_ir
 from .vm import disassemble, json_ir, normalize
 
 STDOUT = Path("-")
 ARTIFACT_NAMES = ("decoded.json", "normalized.json", "instructions.txt", "manifest.json")
+TRACE_ARTIFACT_NAMES = ("trace.json", "manifest.json")
+MODES = ("vm", "auto", "trace")
 
 
 def _timeout(value):
@@ -62,6 +65,9 @@ def _parser():
             command.add_argument("--style", choices=STYLES, default="auto",
                                  help="auto: idiomatic Luau when provable, else registers (default)")
             command.add_argument("--json", action="store_true", help="print the manifest as JSON instead of text")
+            command.add_argument("--mode", choices=MODES, default="vm",
+                                 help="vm: static profile only, never runs the program (default); trace: run it in a "
+                                      "symbolic sandbox; auto: vm, and trace when the layout is not supported")
     return parser
 
 
@@ -95,6 +101,55 @@ def _summary(found, status):
         print(f"  globals: {names or '-'}; methods: {methods or '-'}", file=status)
 
 
+def _deliver(args, recovered, manifest, json_artifacts, listing, output, to_stdout, status, artifacts,
+             headline, profile, compiled, note, found):
+    """Write the recovered source, optional artifacts and the final report."""
+    if to_stdout:
+        sys.stdout.write(recovered)
+    else:
+        write_text(output, recovered)
+    if artifacts:
+        for name, value in json_artifacts.items():
+            write_json(artifacts / name, value)
+        if listing is not None:
+            write_text(artifacts / "instructions.txt", listing)
+        write_json(artifacts / "manifest.json", manifest)
+    if args.json:
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    elif not args.quiet:
+        verification = "compiled with official Luau" if compiled else "compiler unavailable; syntax was not checked"
+        print(f"{headline}: {'standard output' if to_stdout else output} ({profile}, {verification})", file=status)
+        if note:
+            print(f"  note: {note}", file=status)
+        _summary(found, status)
+
+
+def _recover_by_trace(args, source, digest, luau, output, to_stdout, status, artifacts):
+    if args.command == "dump":
+        raise MoonVeilError("dump needs the static profile; use decompile --mode trace for other layouts")
+    log = trace(source, luau, args.timeout, args.memory_limit)
+    recovered = emit_trace(log)
+    compiled = compile_source(recovered, luau, args.timeout, args.memory_limit)
+    if args.require_compile and compiled is None:
+        raise MoonVeilError("luau-compile is required but was not found; set LUAU_COMPILE_PATH")
+    found = indicators(trace_ir(log))
+    manifest = {
+        "tool_version": __version__, "profile": "symbolic-trace", "mode": "trace",
+        "source_sha256": digest, "output_sha256": hashlib.sha256(recovered.encode()).hexdigest(),
+        "operation_count": len(log["events"]),
+        "emission": "trace", "compiled": compiled, "equivalent": None,
+        "protected_program_executed": True,
+        "indicators": {key: found[key] for key in ("urls", "globals", "methods", "behaviors")},
+        "notes": ["The program ran in official Luau against a symbolic environment: every global outside the pure "
+                  "standard libraries is a recording stand-in, so nothing reached a real API, file or network.",
+                  "Only the operations on the environment along the executed path are recovered; the original "
+                  "control flow, names and any computation that does not touch the environment are not."]}
+    note = "executed in the symbolic sandbox (protected program ran; no real API was reachable)"
+    _deliver(args, recovered, manifest, {"trace.json": log_json(log)}, None, output, to_stdout, status, artifacts,
+             f"Recovered {len(log['events'])} environment operations", "trace", compiled, note, found)
+    return 0
+
+
 def main(argv=None):
     args = _parser().parse_args(argv)
     try:
@@ -106,9 +161,11 @@ def main(argv=None):
                 wrapper = parse_wrapper(source)
                 report.update(supported=True, version="2.1.0", profile="table-dispatch-210", roles=wrapper.roles)
             except MoonVeilError as exc:
-                report["reason"] = str(exc)
+                layout = diagnose(source)
+                report.update(reason=str(exc), layout=layout, hint=explain_layout(layout))
             print(json.dumps(report, indent=2) if args.json else (
-                f"MoonVeil 2.1.0: supported table-dispatch profile ({len(raw)} bytes)" if report["supported"] else report["reason"]
+                f"MoonVeil 2.1.0: supported table-dispatch profile ({len(raw)} bytes)" if report["supported"]
+                else f"{report['reason']}\n  {report['hint']}"
             ))
             return 0 if report["supported"] else 2
         to_stdout = args.output == STDOUT
@@ -116,13 +173,23 @@ def main(argv=None):
         status = sys.stderr if to_stdout else sys.stdout
         if getattr(args, "json", False) and to_stdout:
             raise MoonVeilError("--json prints to standard output; choose a file with -o")
+        mode = getattr(args, "mode", "vm")
+        wrapper = None
+        if mode != "trace":
+            try:
+                wrapper = parse_wrapper(source)
+            except MoonVeilError as exc:
+                if mode != "auto":
+                    raise MoonVeilError(f"{exc}\n  {explain_layout(diagnose(source))}") from exc
         artifacts = getattr(args, "artifacts", None)
         destinations = [] if to_stdout else [output]
         if artifacts:
-            destinations += [artifacts / name for name in ARTIFACT_NAMES]
+            names = TRACE_ARTIFACT_NAMES if wrapper is None else ARTIFACT_NAMES
+            destinations += [artifacts / name for name in names]
         check_destinations(args.input, destinations)
-        wrapper = parse_wrapper(source)
         luau = find_luau(args.luau)
+        if wrapper is None:
+            return _recover_by_trace(args, source, digest, luau, output, to_stdout, status, artifacts)
         graph = decode(wrapper, luau, args.timeout, args.memory_limit)
         if args.command == "dump":
             if to_stdout:
@@ -143,7 +210,7 @@ def main(argv=None):
         if note:
             notes.append(note)
         manifest = {
-            "tool_version": __version__, "moonveil_version": "2.1.0", "profile": "table-dispatch-210",
+            "tool_version": __version__, "moonveil_version": "2.1.0", "profile": "table-dispatch-210", "mode": "vm",
             "source_sha256": digest, "output_sha256": hashlib.sha256(recovered.encode()).hexdigest(),
             "instruction_count": len(ir["instructions"]),
             "semantic_instruction_count": sum(ins["op"] != "nop" for ins in ir["instructions"]),
@@ -151,24 +218,9 @@ def main(argv=None):
             "protected_program_executed": False,
             "indicators": {key: found[key] for key in ("urls", "globals", "methods", "behaviors")},
             "notes": notes}
-        if to_stdout:
-            sys.stdout.write(recovered)
-        else:
-            write_text(output, recovered)
-        if artifacts:
-            write_json(artifacts / "decoded.json", graph)
-            write_json(artifacts / "normalized.json", json_ir(ir))
-            write_text(artifacts / "instructions.txt", disassemble(ir))
-            write_json(artifacts / "manifest.json", manifest)
-        if args.json:
-            print(json.dumps(manifest, ensure_ascii=False, indent=2))
-        elif not args.quiet:
-            verification = "compiled with official Luau" if compiled else "compiler unavailable; syntax was not checked"
-            print(f"Recovered {len(ir['instructions'])} instructions: {'standard output' if to_stdout else output} "
-                  f"({profile}, {verification})", file=status)
-            if note:
-                print(f"  note: {note}", file=status)
-            _summary(found, status)
+        extra = {"decoded.json": graph, "normalized.json": json_ir(ir)}
+        _deliver(args, recovered, manifest, extra, disassemble(ir), output, to_stdout, status, artifacts,
+                 f"Recovered {len(ir['instructions'])} instructions", profile, compiled, note, found)
         return 0
     except BrokenPipeError:
         # The reader went away (e.g. ``| head``); keep Python from printing a second error at exit.
